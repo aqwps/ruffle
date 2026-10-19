@@ -1,0 +1,3 @@
+Ordinary unload keeps the event sound playing
+Stop the first loader, preserve the second loader's sound
+Stop the second loader; no sounds remain

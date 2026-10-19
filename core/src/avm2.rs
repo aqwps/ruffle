@@ -168,7 +168,7 @@ pub struct Avm2<'gc> {
     /// Certain types of events are "broadcast events" that are emitted on all
     /// constructed objects in order of their creation, whether or not they are
     /// currently present on the display list. This list keeps track of that.
-    broadcast_list: FnvHashMap<AvmString<'gc>, Vec<WeakObject<'gc>>>,
+    broadcast_list: FnvHashMap<AvmString<'gc>, Vec<BroadcastTarget<'gc>>>,
 
     alias_to_class_map: FnvHashMap<AvmString<'gc>, ClassObject<'gc>>,
     class_to_alias_map: FnvHashMap<Class<'gc>, AvmString<'gc>>,
@@ -190,6 +190,15 @@ pub struct Avm2<'gc> {
     pub debug_output: bool,
 
     pub optimizer_enabled: bool,
+}
+
+/// Inactive targets retain their position so re-registering a listener does not
+/// change broadcast order. The weak reference does not keep the target alive.
+#[derive(Clone, Copy, Collect)]
+#[collect(no_drop)]
+struct BroadcastTarget<'gc> {
+    object: WeakObject<'gc>,
+    active: bool,
 }
 
 impl<'gc> Avm2<'gc> {
@@ -384,17 +393,43 @@ impl<'gc> Avm2<'gc> {
             return;
         }
 
+        let active = events::has_broadcast_listener(object, event_name);
         let bucket = context.avm2.broadcast_list.entry(event_name).or_default();
 
-        for entry in bucket.iter() {
+        for entry in bucket.iter_mut() {
             // Note: comparing pointers is correct because GcWeak keeps its allocation alive,
             // so the pointers can't overlap by accident.
-            if std::ptr::eq(entry.as_ptr(), object.as_ptr()) {
+            if std::ptr::eq(entry.object.as_ptr(), object.as_ptr()) {
+                entry.active = active;
                 return;
             }
         }
 
-        bucket.push(object.downgrade());
+        bucket.push(BroadcastTarget {
+            object: object.downgrade(),
+            active,
+        });
+    }
+
+    /// Refresh the active flag after removing a listener without inserting a new
+    /// target or changing the historical order of existing targets.
+    pub fn unregister_broadcast_listener(
+        context: &mut UpdateContext<'gc>,
+        object: Object<'gc>,
+        event_name: AvmString<'gc>,
+    ) {
+        if !BROADCAST_WHITELIST.iter().any(|x| *x == &event_name)
+            || events::has_broadcast_listener(object, event_name)
+        {
+            return;
+        }
+        if let Some(bucket) = context.avm2.broadcast_list.get_mut(&event_name)
+            && let Some(entry) = bucket
+                .iter_mut()
+                .find(|entry| std::ptr::eq(entry.object.as_ptr(), object.as_ptr()))
+        {
+            entry.active = false;
+        }
     }
 
     /// Dispatch an event on all objects in the current execution list.
@@ -435,7 +470,9 @@ impl<'gc> Avm2<'gc> {
                 .get(i)
                 .copied();
 
-            if let Some(object) = object.and_then(|obj| obj.upgrade(context.gc()))
+            if let Some(object) = object
+                .filter(|target| target.active)
+                .and_then(|target| target.object.upgrade(context.gc()))
                 && object.is_of_type(on_type.inner_class_definition())
             {
                 let mut activation = Activation::from_nothing(context);
@@ -449,7 +486,7 @@ impl<'gc> Avm2<'gc> {
             .broadcast_list
             .entry(event_name)
             .or_default()
-            .retain(|x| x.upgrade(context.gc_context).is_some());
+            .retain(|target| target.object.upgrade(context.gc_context).is_some());
     }
 
     pub fn lookup_class_for_character(

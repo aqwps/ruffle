@@ -885,6 +885,11 @@ impl<'gc> Object<'gc> {
         self.as_event_object().map(|o| o.event_mut(mc))
     }
 
+    /// Unwrap this object as an immutable list of event handlers.
+    pub fn as_dispatch(&self) -> Option<Ref<'_, DispatchList<'gc>>> {
+        self.as_dispatch_object().map(|o| o.dispatch())
+    }
+
     /// Unwrap this object as a mutable list of event handlers.
     pub fn as_dispatch_mut(&self, mc: &Mutation<'gc>) -> Option<RefMut<'_, DispatchList<'gc>>> {
         self.as_dispatch_object().map(|o| o.dispatch_mut(mc))

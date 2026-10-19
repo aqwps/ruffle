@@ -1,0 +1,15 @@
+frame 1
+A
+C
+D
+frame 2
+B
+C
+E
+frame 3
+A
+E
+frame 4
+A
+B
+E

@@ -39,7 +39,7 @@ pub trait RenderTarget: Debug + 'static {
 
 #[derive(Debug)]
 pub struct SwapChainTarget {
-    window_surface: wgpu::Surface<'static>,
+    window_surface: Option<wgpu::Surface<'static>>,
     surface_config: wgpu::SurfaceConfiguration,
 }
 
@@ -104,8 +104,14 @@ impl SwapChainTarget {
         surface.configure(device, &surface_config);
         Self {
             surface_config,
-            window_surface: surface,
+            window_surface: Some(surface),
         }
+    }
+
+    /// Release the platform window before Android destroys it, while keeping
+    /// the device and movie-owned resources available for background scripts.
+    pub fn suspend(&mut self) {
+        self.window_surface = None;
     }
 }
 
@@ -115,7 +121,9 @@ impl RenderTarget for SwapChainTarget {
     fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
         self.surface_config.width = width;
         self.surface_config.height = height;
-        self.window_surface.configure(device, &self.surface_config);
+        if let Some(surface) = &self.window_surface {
+            surface.configure(device, &self.surface_config);
+        }
     }
 
     fn format(&self) -> wgpu::TextureFormat {
@@ -131,7 +139,7 @@ impl RenderTarget for SwapChainTarget {
     }
 
     fn get_next_texture(&mut self) -> Option<Self::Frame> {
-        let texture = match self.window_surface.get_current_texture() {
+        let texture = match self.window_surface.as_ref()?.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(surface_texture) => surface_texture,
             // The texture is still usable - no reason to waste an already
             // acquired frame. Ideally the surface should also be reconfigured

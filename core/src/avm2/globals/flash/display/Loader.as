@@ -32,8 +32,11 @@ package flash.display {
         [API("662")]
         public function unloadAndStop(gc:Boolean = true):void {
             stub_method("flash.display.Loader", "unloadAndStop");
+            this.stopLoadedContent();
             this.unload();
         }
+
+        private native function stopLoadedContent():void;
 
         public function close():void {
             stub_method("flash.display.Loader", "close");

@@ -68,6 +68,8 @@ pub fn remove_event_listener<'gc>(
         .expect("Internal properties should have what I put in them")
         .remove_event_listener(event_type, listener, use_capture);
 
+    Avm2::unregister_broadcast_listener(activation.context, this, event_type);
+
     Ok(Value::Undefined)
 }
 
@@ -83,7 +85,7 @@ pub fn has_event_listener<'gc>(
     let event_type = args.get_string(activation, 0);
 
     let does_have = dispatch_list
-        .as_dispatch_mut(activation.gc())
+        .as_dispatch()
         .expect("Internal properties should have what I put in them")
         .has_event_listener(event_type)
         .into();
@@ -103,7 +105,7 @@ pub fn will_trigger<'gc>(
     let event_type = args.get_string(activation, 0);
 
     if dispatch_list
-        .as_dispatch_mut(activation.gc())
+        .as_dispatch()
         .expect("Internal properties should have what I put in them")
         .has_event_listener(event_type)
     {

@@ -2120,6 +2120,7 @@ impl Player {
                 library: &mut gc_root.library,
                 ui: this.ui.deref(),
                 transform_stack: &mut this.transform_stack,
+                untransformed_object: None,
                 is_offscreen: false,
                 use_bitmap_cache: true,
                 stage,

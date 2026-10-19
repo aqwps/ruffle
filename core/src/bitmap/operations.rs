@@ -1477,6 +1477,7 @@ pub fn draw<'gc>(
         library: context.library,
         ui: context.ui,
         transform_stack: &mut transform_stack,
+        untransformed_object: None,
         is_offscreen: true,
         use_bitmap_cache: false,
         stage: context.stage,

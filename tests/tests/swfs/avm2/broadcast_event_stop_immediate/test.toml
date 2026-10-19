@@ -1,0 +1,10 @@
+num_frames = 2
+
+[player_options]
+with_default_font = true
+
+[[compilers]]
+type = "Asc"
+class = "Test"
+scripts = ["Test.as"]
+swf_version = 11

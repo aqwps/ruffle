@@ -27,6 +27,9 @@ use winit::event_loop::EventLoopProxy;
 use winit::raw_window_handle::HasDisplayHandle;
 use winit::window::{Fullscreen, Window};
 
+#[cfg(windows)]
+mod windows;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeviceFontRenderer {
     Embedded,
@@ -386,6 +389,15 @@ impl UiBackend for DesktopUiBackend {
         register: &mut dyn FnMut(FontDefinition),
     ) -> Vec<FontQuery> {
         cfg_select! {
+            windows => {
+                windows::sort_device_fonts(
+                    &self.font_database,
+                    query,
+                    register,
+                    self.device_font_renderer,
+                    &self.font_atlases,
+                )
+            }
             all(unix, feature = "fontconfig") => {
                 fontconfig::sort_device_fonts(query, register, self.device_font_renderer, &self.font_atlases)
                     .inspect_err(|err| tracing::error!("Cannot sort device fonts: {err}"))

@@ -1,0 +1,33 @@
+num_frames = 20
+
+[player_options]
+with_audio = true
+
+[[compilers]]
+type = "Asc"
+class = "Test"
+scripts = ["Test.as"]
+swf_version = 11
+
+[audio_assertions.ordinary_unload]
+frames = [5]
+min_max_amplitude = 0.24
+max_amplitude = 0.26
+
+[audio_assertions.stop_all]
+frames = [7]
+max_amplitude = 0.0
+
+[audio_assertions.two_loaders]
+frames = [11]
+min_max_amplitude = 0.49
+max_amplitude = 0.51
+
+[audio_assertions.other_loader_survives]
+frames = [14]
+min_max_amplitude = 0.24
+max_amplitude = 0.26
+
+[audio_assertions.unload_and_stop]
+frames = [17, 20]
+max_amplitude = 0.0

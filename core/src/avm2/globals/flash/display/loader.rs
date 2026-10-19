@@ -20,8 +20,10 @@ use crate::avm2_stub_method;
 use crate::backend::navigator::{NavigationMethod, Request};
 use crate::display_object::LoaderDisplay;
 use crate::display_object::MovieClip;
+use crate::display_object::{DisplayObject, TDisplayObject};
 use crate::loader::LoadManager;
 use crate::loader::MovieLoaderVMData;
+use crate::prelude::TDisplayObjectContainer;
 use crate::tag_utils::{SwfMovie, SwfMovieData};
 use ruffle_common::tag_utils::LoadBytesInfo;
 
@@ -311,6 +313,36 @@ pub fn load_bytes<'gc>(
         ));
     }
 
+    Ok(Value::Undefined)
+}
+
+/// Stop timelines and their sounds before `unloadAndStop` detaches the content.
+/// Other unloadAndStop cleanup (timers and event listeners) is still unimplemented.
+pub fn stop_loaded_content<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    this: Value<'gc>,
+    _args: FunctionArgs<'_, 'gc>,
+) -> Result<Value<'gc>, Error<'gc>> {
+    fn stop_timelines<'gc>(
+        object: DisplayObject<'gc>,
+        context: &mut crate::context::UpdateContext<'gc>,
+    ) {
+        if let Some(mc) = object.as_movie_clip() {
+            mc.stop(context);
+        }
+        if let Some(container) = object.as_container() {
+            for child in container.iter_render_list() {
+                stop_timelines(child, context);
+            }
+        }
+    }
+
+    let loader = this.as_object().unwrap().as_display_object().unwrap();
+    stop_timelines(loader, activation.context);
+    activation
+        .context
+        .audio_manager
+        .stop_sounds_on_parent_and_children(activation.context.audio, loader);
     Ok(Value::Undefined)
 }
 

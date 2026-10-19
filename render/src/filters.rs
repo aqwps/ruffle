@@ -93,7 +93,37 @@ impl Filter {
             Filter::DropShadowFilter(filter) => filter.calculate_dest_rect(source_rect),
             Filter::BevelFilter(filter) => filter.calculate_dest_rect(source_rect),
             Filter::DisplacementMapFilter(filter) => filter.calculate_dest_rect(source_rect),
-            _ => source_rect,
+            Self::ColorMatrixFilter(_)
+            | Self::ConvolutionFilter(_)
+            | Self::GradientBevelFilter(_)
+            | Self::GradientGlowFilter(_)
+            | Self::ShaderFilter(_) => source_rect,
+        }
+    }
+
+    /// Calculate bounds at the stage scale without cloning filters whose
+    /// parameters do not affect bounds (which can contain large allocations).
+    pub fn calculate_scaled_dest_rect(
+        &self,
+        source_rect: Rectangle<Twips>,
+        x: f32,
+        y: f32,
+    ) -> Rectangle<Twips> {
+        match self {
+            Self::BlurFilter(_)
+            | Self::GlowFilter(_)
+            | Self::DropShadowFilter(_)
+            | Self::BevelFilter(_)
+            | Self::DisplacementMapFilter(_) => {
+                let mut filter = self.clone();
+                filter.scale(x, y);
+                filter.calculate_dest_rect(source_rect)
+            }
+            Self::ColorMatrixFilter(_)
+            | Self::ConvolutionFilter(_)
+            | Self::GradientBevelFilter(_)
+            | Self::GradientGlowFilter(_)
+            | Self::ShaderFilter(_) => source_rect,
         }
     }
 

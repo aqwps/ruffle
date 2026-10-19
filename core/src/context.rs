@@ -591,6 +591,10 @@ pub struct RenderContext<'a, 'gc> {
     /// The transform stack controls the matrix and color transform as we traverse the display hierarchy.
     pub transform_stack: &'a mut TransformStack,
 
+    /// A render root whose own matrix is being ignored (e.g. BitmapData.draw).
+    /// Its stored scale must not influence its vector artwork's scaling grid.
+    pub untransformed_object: Option<crate::display_object::DisplayObject<'gc>>,
+
     /// Whether we're rendering offscreen. This can disable some logic like Ruffle-side render culling
     pub is_offscreen: bool,
 

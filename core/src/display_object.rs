@@ -37,6 +37,7 @@ mod interactive;
 mod loader_display;
 mod morph_shape;
 mod movie_clip;
+pub(crate) mod scale9_grid;
 mod stage;
 mod text;
 mod text_line;
@@ -89,6 +90,9 @@ use self::loader_display::LoaderDisplayWeak;
 ///
 #[derive(Clone, Debug, Default)]
 pub struct BitmapCache {
+    /// A shape's slices can change when its parent's grid or bounds change,
+    /// even if its own transform and the cache dimensions stay the same.
+    scale9_grid: Option<scale9_grid::CacheKey>,
     /// The `Matrix.a` value that was last used with this cache
     matrix_a: f32,
     /// The `Matrix.b` value that was last used with this cache
@@ -967,6 +971,11 @@ pub fn render_base<'gc>(
         return;
     }
 
+    let untransformed_object = context.untransformed_object;
+    if !options.apply_transform || !options.apply_matrix {
+        context.untransformed_object = Some(this);
+    }
+
     if options.apply_transform {
         let transform = this.base().transform(options.apply_matrix);
         context.transform_stack.push(&transform);
@@ -980,6 +989,7 @@ pub fn render_base<'gc>(
     };
 
     let cache_info = if context.use_bitmap_cache && this.is_bitmap_cached() {
+        let scale9_grid = scale9_grid::cache_key(this, context.untransformed_object);
         let mut cache_info: Option<DrawCacheInfo> = None;
         let base_transform = context.transform_stack.transform();
         let bounds: Rectangle<Twips> = this.render_bounds_with_transform(
@@ -988,28 +998,66 @@ pub fn render_base<'gc>(
             &context.stage.view_matrix(),
         );
         let name = this.name();
-        let mut filters: Vec<Filter> = this.filters().to_owned();
         let swf_version = this.swf_version();
-        filters.retain(|f| !f.impotent());
-
-        if let Some(cache) = &mut *this.base().bitmap_cache_mut() {
-            let width = bounds.width().to_pixels().ceil().max(0.0);
-            let height = bounds.height().to_pixels().ceil().max(0.0);
+        let width = bounds.width().to_pixels().ceil().max(0.0);
+        let height = bounds.height().to_pixels().ceil().max(0.0);
+        let stage_matrix = context.stage.view_matrix();
+        let dirty = this
+            .base()
+            .bitmap_cache_mut()
+            .as_ref()
+            .is_some_and(|cache| {
+                cache.scale9_grid != scale9_grid
+                    || cache.is_dirty(&base_transform.matrix, width as u32, height as u32)
+            });
+        let mut filter_rect = Rectangle::default();
+        let filters = {
+            let filters = this.filters();
+            // Clean bitmaps still need fresh bounds, but do not consume filter
+            // parameters. Avoid cloning their potentially large payloads.
+            let mut scaled_filters: Vec<_> = if dirty {
+                filters
+                    .iter()
+                    .filter(|filter| !filter.impotent())
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            };
             if width <= u16::MAX as f64 && height <= u16::MAX as f64 {
-                let width = width as u32;
-                let height = height as u32;
-                let mut filter_rect = Rectangle {
+                filter_rect = Rectangle {
                     x_min: Twips::ZERO,
                     x_max: Twips::from_pixels_i32(width as i32),
                     y_min: Twips::ZERO,
                     y_max: Twips::from_pixels_i32(height as i32),
                 };
-                let stage_matrix = context.stage.view_matrix();
-                for filter in &mut filters {
-                    // Scaling is done by *stage view matrix* only, nothing in-between
-                    filter.scale(stage_matrix.a, stage_matrix.d);
-                    filter_rect = filter.calculate_dest_rect(filter_rect);
+                // Filter growth depends on stage scale, not object scale.
+                if dirty {
+                    for filter in &mut scaled_filters {
+                        filter.scale(stage_matrix.a, stage_matrix.d);
+                        filter_rect = filter.calculate_dest_rect(filter_rect);
+                    }
+                } else {
+                    for filter in filters.iter().filter(|filter| !filter.impotent()) {
+                        filter_rect = filter.calculate_scaled_dest_rect(
+                            filter_rect,
+                            stage_matrix.a,
+                            stage_matrix.d,
+                        );
+                    }
                 }
+            }
+            scaled_filters
+        };
+
+        if let Some(cache) = &mut *this.base().bitmap_cache_mut() {
+            if cache.scale9_grid != scale9_grid {
+                cache.make_dirty();
+                cache.scale9_grid = scale9_grid;
+            }
+            if width <= u16::MAX as f64 && height <= u16::MAX as f64 {
+                let width = width as u32;
+                let height = height as u32;
                 let filter_rect = Rectangle {
                     x_min: filter_rect.x_min.to_pixels().floor() as i32,
                     x_max: filter_rect.x_max.to_pixels().ceil() as i32,
@@ -1017,7 +1065,7 @@ pub fn render_base<'gc>(
                     y_max: filter_rect.y_max.to_pixels().ceil() as i32,
                 };
                 let draw_offset = Point::new(filter_rect.x_min, filter_rect.y_min);
-                if cache.is_dirty(&base_transform.matrix, width, height) {
+                if dirty {
                     cache.update(
                         context.renderer,
                         base_transform.matrix,
@@ -1043,7 +1091,7 @@ pub fn render_base<'gc>(
                         base_transform,
                         bounds,
                         draw_offset,
-                        filters,
+                        filters: Vec::new(),
                     });
                 }
             } else {
@@ -1093,6 +1141,7 @@ pub fn render_base<'gc>(
                 library: context.library,
                 ui: context.ui,
                 transform_stack: &mut transform_stack,
+                untransformed_object: context.untransformed_object,
                 is_offscreen: true,
                 use_bitmap_cache: true,
                 stage: context.stage,
@@ -1175,6 +1224,7 @@ pub fn render_base<'gc>(
     if options.apply_transform {
         context.transform_stack.pop();
     }
+    context.untransformed_object = untransformed_object;
 }
 
 /// This applies the **standard** method of `mask` and `scrollRect`.
@@ -1453,9 +1503,8 @@ pub trait TDisplayObject<'gc>:
         }
 
         if include_own_filters {
-            for mut filter in self.filters().iter().cloned() {
-                filter.scale(view_matrix.a, view_matrix.d);
-                bounds = filter.calculate_dest_rect(bounds);
+            for filter in self.filters().iter() {
+                bounds = filter.calculate_scaled_dest_rect(bounds, view_matrix.a, view_matrix.d);
             }
         }
 
@@ -2077,7 +2126,9 @@ pub trait TDisplayObject<'gc>:
 
     #[no_dynamic]
     fn set_scaling_grid(self, rect: Rectangle<Twips>) {
-        self.base().scaling_grid.set(rect);
+        if self.base().scaling_grid.replace(rect) != rect {
+            self.invalidate_cached_bitmap();
+        }
     }
 
     #[no_dynamic]

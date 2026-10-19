@@ -59,6 +59,7 @@ impl<'gc> Graphic<'gc> {
             shape: swf_shape,
             movie,
             scaled_handle: RefCell::new(TessellationCache::new()),
+            gradient_cache: Default::default(),
         };
 
         Graphic(Gc::new(
@@ -93,6 +94,7 @@ impl<'gc> Graphic<'gc> {
             },
             movie: *context.root_swf,
             scaled_handle: RefCell::new(TessellationCache::new()),
+            gradient_cache: Default::default(),
         };
 
         Graphic(Gc::new(
@@ -246,22 +248,36 @@ impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
             return;
         }
 
-        if let Some(drawing) = self.0.drawing.get() {
-            drawing.borrow().render(context);
-        } else if !self.0.shared.get().shape.shape.is_empty() {
-            let transform = context.transform_stack.transform();
+        super::scale9_grid::render(self.into(), context, |context, correction| {
+            if let Some(drawing) = self.0.drawing.get() {
+                drawing
+                    .borrow()
+                    .render_with_scale9_grid(context, correction);
+            } else if !self.0.shared.get().shape.shape.is_empty() {
+                let transform = context.transform_stack.transform();
 
-            // Calculate the current scale from the transform, to determine if
-            // we can reuse a cached tessellation or need to retessellate.
-            let matrix = &transform.matrix;
-            let scale_x = f32::abs(matrix.a + matrix.c);
-            let scale_y = f32::abs(matrix.b + matrix.d);
-            let current_scale = ((scale_x * scale_x + scale_y * scale_y) / 2.0).sqrt();
+                // Calculate the current scale from the transform, to determine if
+                // we can reuse a cached tessellation or need to retessellate.
+                let matrix = &transform.matrix;
+                let scale_x = f32::abs(matrix.a + matrix.c);
+                let scale_y = f32::abs(matrix.b + matrix.d);
+                let current_scale = ((scale_x * scale_x + scale_y * scale_y) / 2.0).sqrt();
 
-            let handle = self.get_or_retessellate_handle(context, current_scale);
+                let handle = self.get_or_retessellate_handle(context, current_scale);
 
-            context.commands.render_shape(handle, transform)
-        }
+                let shared = self.0.shared.get();
+                let library = context.library.library_for_movie(shared.movie).unwrap();
+                let handle = shared.gradient_cache.get(
+                    context.renderer,
+                    &MovieLibrarySource { library },
+                    handle,
+                    correction,
+                    current_scale,
+                    || (&shared.shape).into(),
+                );
+                context.commands.render_shape(handle, transform)
+            }
+        });
     }
 
     fn hit_test_shape(
@@ -343,4 +359,7 @@ struct GraphicShared<'gc> {
 
     #[collect(require_static)]
     scaled_handle: RefCell<TessellationCache>,
+
+    #[collect(require_static)]
+    gradient_cache: super::scale9_grid::GradientCache,
 }

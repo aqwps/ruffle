@@ -11,7 +11,7 @@ use crate::surface::target::CommandTarget;
 use crate::{Descriptors, MaskState, Pipelines, PosUvVertex, Transforms, as_texture};
 use ruffle_render::backend::ShapeHandle;
 use ruffle_render::bitmap::{BitmapHandle, PixelRegion, PixelSnapping};
-use ruffle_render::commands::{CommandHandler, CommandList, RenderBlendMode};
+use ruffle_render::commands::{Command, CommandHandler, CommandList, RenderBlendMode};
 use ruffle_render::lines::{emulate_line, emulate_line_rect};
 use ruffle_render::matrix::Matrix;
 use ruffle_render::pixel_bender::PixelBenderShaderHandle;
@@ -404,6 +404,9 @@ impl<'encoder> CommandRenderer<'encoder> {
 }
 
 pub enum Chunk {
+    /// Keep independent layers as commands until their parent is ready to
+    /// composite them, rather than holding every sibling's rendered texture.
+    Deferred(Command),
     Draw {
         chunk: Vec<DrawCommand>,
         needs_stencil: bool,
@@ -489,8 +492,8 @@ pub enum LayerRef<'a> {
     Parent(&'a CommandTarget),
 }
 
-/// Replaces every blend with a RenderBitmap, with the subcommands rendered out to a temporary texture
-/// Every complex blend will be its own item, but every other draw will be chunked together
+/// Prepare draw chunks, retaining independent offscreen commands until their
+/// composition point instead of allocating all sibling outputs in advance.
 #[expect(clippy::too_many_arguments)]
 pub fn chunk_blends<'encoder, 'global: 'encoder>(
     commands: CommandList,
@@ -504,8 +507,9 @@ pub fn chunk_blends<'encoder, 'global: 'encoder>(
     height: u32,
     nearest_layer: LayerRef,
     texture_pool: &'encoder mut TexturePool,
+    defer_blends: bool,
 ) -> Vec<Chunk> {
-    WgpuCommandHandler::new(
+    let mut handler = WgpuCommandHandler::new(
         descriptors,
         staging_belt,
         dynamic_transforms,
@@ -516,8 +520,39 @@ pub fn chunk_blends<'encoder, 'global: 'encoder>(
         height,
         nearest_layer,
         texture_pool,
-    )
-    .chunk_blends(commands)
+    );
+    handler.defer_blends = defer_blends;
+    handler.chunk_blends(commands)
+}
+
+/// Alpha/erase read an ancestor layer. Keep their preparation order unchanged,
+/// along with shaders and masks, until those dependencies can be scheduled too.
+fn independent_blend(commands: &CommandList, mode: &RenderBlendMode) -> bool {
+    if !matches!(mode, RenderBlendMode::Builtin(mode) if !matches!(mode, BlendMode::Alpha | BlendMode::Erase))
+    {
+        return false;
+    }
+    commands.commands.iter().all(|command| match command {
+        Command::Blend(commands, mode) => independent_blend(commands, mode),
+        Command::PushMask
+        | Command::ActivateMask
+        | Command::DeactivateMask
+        | Command::PopMask
+        | Command::RenderAlphaMask { .. } => false,
+        Command::RenderBitmap { .. }
+        | Command::RenderShape { .. }
+        | Command::RenderStage3D { .. }
+        | Command::DrawRect { .. }
+        | Command::DrawLine { .. }
+        | Command::DrawLineRect { .. } => true,
+    })
+}
+
+/// Diagnostic fallback for comparing resource peaks with the eager scheduler.
+pub fn defer_independent_layers() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("RUFFLE_GPU_EAGER_LAYERS").is_none());
+    *ENABLED
 }
 
 struct WgpuCommandHandler<'encoder, 'global: 'encoder> {
@@ -532,6 +567,7 @@ struct WgpuCommandHandler<'encoder, 'global: 'encoder> {
     draw_encoder: &'encoder mut Scope<'global, wgpu::CommandEncoder>,
     texture_pool: &'encoder mut TexturePool,
     emulate_lines: bool,
+    defer_blends: bool,
 
     result: Vec<Chunk>,
     current: Vec<DrawCommand>,
@@ -575,6 +611,7 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
             draw_encoder,
             texture_pool,
             emulate_lines,
+            defer_blends: true,
 
             result: vec![],
             current: vec![],
@@ -608,9 +645,13 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
     fn chunk_blends(&mut self, commands: CommandList) -> Vec<Chunk> {
         commands.execute(self);
 
+        self.flush_current();
+        mem::take(&mut self.result)
+    }
+
+    fn flush_current(&mut self) {
         let current = mem::take(&mut self.current);
-        let mut result = mem::take(&mut self.result);
-        let needs_stencil = mem::take(&mut self.needs_stencil);
+        let needs_stencil = self.needs_stencil;
         let transforms = mem::replace(
             &mut self.transforms,
             Self::new_transforms(self.descriptors, self.dynamic_transforms),
@@ -621,15 +662,14 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
         );
 
         if !current.is_empty() {
-            result.push(Chunk::Draw {
+            self.result.push(Chunk::Draw {
                 chunk: current,
                 needs_stencil,
                 transforms,
                 vertices,
             });
         }
-
-        result
+        self.needs_stencil = self.num_masks > 0;
     }
 
     fn add_to_current(
@@ -707,6 +747,16 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
 
 impl CommandHandler for WgpuCommandHandler<'_, '_> {
     fn blend(&mut self, commands: CommandList, blend_mode: RenderBlendMode) {
+        if self.defer_blends && self.num_masks == 0 && independent_blend(&commands, &blend_mode) {
+            self.texture_pool.record_layer(true);
+            self.flush_current();
+            self.result
+                .push(Chunk::Deferred(Command::Blend(commands, blend_mode)));
+            return;
+        }
+        if self.defer_blends {
+            self.texture_pool.record_layer(false);
+        }
         let surface = Surface::new(
             self.descriptors,
             self.quality,
@@ -963,6 +1013,23 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
     }
 
     fn render_alpha_mask(&mut self, maskee_commands: CommandList, mask_commands: CommandList) {
+        let normal = RenderBlendMode::Builtin(BlendMode::Normal);
+        if self.defer_blends
+            && self.num_masks == 0
+            && independent_blend(&maskee_commands, &normal)
+            && independent_blend(&mask_commands, &normal)
+        {
+            self.texture_pool.record_layer(true);
+            self.flush_current();
+            self.result.push(Chunk::Deferred(Command::RenderAlphaMask {
+                maskee_commands,
+                mask_commands,
+            }));
+            return;
+        }
+        if self.defer_blends {
+            self.texture_pool.record_layer(false);
+        }
         let surface = Surface::new(
             self.descriptors,
             self.quality,
@@ -1032,5 +1099,30 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
                 instance_index,
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod scheduling_tests {
+    use super::*;
+
+    #[test]
+    fn ancestor_reads_and_masks_keep_the_original_preparation_path() {
+        let normal = RenderBlendMode::Builtin(BlendMode::Normal);
+        let commands = CommandList::new();
+        assert!(independent_blend(&commands, &normal));
+        for mode in [BlendMode::Alpha, BlendMode::Erase] {
+            let mode = RenderBlendMode::Builtin(mode);
+            assert!(!independent_blend(&commands, &mode));
+            let mut nested = CommandList::new();
+            nested.blend(commands.clone(), mode);
+            assert!(!independent_blend(&nested, &normal));
+        }
+        let mut masked = CommandList::new();
+        masked.commands.push(Command::PushMask);
+        assert!(!independent_blend(&masked, &normal));
+        let mut alpha_mask = CommandList::new();
+        alpha_mask.render_alpha_mask(CommandList::new(), CommandList::new());
+        assert!(!independent_blend(&alpha_mask, &normal));
     }
 }

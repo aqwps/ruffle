@@ -494,6 +494,23 @@ impl<'gc> Library<'gc> {
             }
         }
 
+        // Default aliases such as `_sans` need the same glyph fallbacks as
+        // explicitly named device fonts. Keep the selected family as the main
+        // font, but ask the backend for the rest of its font set as well.
+        if let Some(font) = result.first() {
+            let fonts = self.get_or_sort_device_fonts(
+                font.descriptor().name(),
+                font.descriptor().bold(),
+                font.descriptor().italic(),
+                ui,
+                renderer,
+                gc_context,
+            );
+            if !fonts.is_empty() {
+                result = fonts;
+            }
+        }
+
         self.default_font_cache
             .insert((name, is_bold, is_italic), result.clone());
         result

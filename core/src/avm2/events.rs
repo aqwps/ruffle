@@ -9,6 +9,7 @@ use crate::display_object::TDisplayObject;
 use crate::string::AvmString;
 use fnv::FnvHashMap;
 use gc_arena::Collect;
+use smallvec::SmallVec;
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 
@@ -267,6 +268,12 @@ impl<'gc> DispatchList<'gc> {
         false
     }
 
+    /// Whether a broadcast can invoke a listener on this target. Capture-only
+    /// listeners do not run during the at-target phase of a broadcast.
+    pub fn has_broadcast_listener(&self, event: AvmString<'gc>) -> bool {
+        self.iter_event_handlers(event, false).next().is_some()
+    }
+
     /// Yield the event handlers on this dispatch list for a given event.
     ///
     /// Event handlers will be yielded in the order they are intended to be
@@ -276,13 +283,13 @@ impl<'gc> DispatchList<'gc> {
     /// capture phase, or handlers that execute during the bubble and target
     /// phases.
     pub fn iter_event_handlers<'a>(
-        &'a mut self,
+        &'a self,
         event: AvmString<'gc>,
         use_capture: bool,
     ) -> impl 'a + Iterator<Item = FunctionObject<'gc>> {
-        self.get_event_mut(event)
-            .iter()
-            .rev()
+        self.get_event(event)
+            .into_iter()
+            .flat_map(|priorities| priorities.iter().rev())
             .flat_map(|(_p, v)| v.iter())
             .filter(move |eh| eh.use_capture == use_capture)
             .map(|eh| eh.handler)
@@ -293,6 +300,17 @@ impl Default for DispatchList<'_> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+pub fn has_broadcast_listener<'gc>(object: Object<'gc>, event: AvmString<'gc>) -> bool {
+    object
+        .get_slot(slots::DISPATCH_LIST)
+        .as_object()
+        .and_then(|list| {
+            list.as_dispatch()
+                .map(|list| list.has_broadcast_listener(event))
+        })
+        .unwrap_or(false)
 }
 
 /// A single instance of an event handler.
@@ -383,8 +401,10 @@ fn dispatch_event_to_target<'gc>(
     let name = evtmut.event_type();
     let use_capture = evtmut.phase() == EventPhase::Capturing;
 
-    let handlers: Vec<FunctionObject<'gc>> = dispatch_list
-        .as_dispatch_mut(activation.gc())
+    // Keep the snapshot independent of mutations made by event handlers, but
+    // avoid allocating for the common case of only a few listeners.
+    let handlers: SmallVec<[FunctionObject<'gc>; 4]> = dispatch_list
+        .as_dispatch()
         .expect("Internal dispatch list is missing during dispatch!")
         .iter_event_handlers(name, use_capture)
         .collect();
@@ -505,9 +525,13 @@ pub fn broadcast_event<'gc>(
 ) {
     let target = this.get_slot(slots::TARGET).as_object().unwrap_or(this);
 
-    event
-        .event_mut(activation.gc())
-        .set_phase(EventPhase::AtTarget);
+    {
+        let mut event_data = event.event_mut(activation.gc());
+        event_data.set_phase(EventPhase::AtTarget);
+        // The event is reused across broadcast targets. Stopping propagation on
+        // one target must not prevent listeners on other targets from running.
+        event_data.propagation = PropagationMode::Allow;
+    }
 
     dispatch_event_to_target(activation, this, target, target, event, false);
 }

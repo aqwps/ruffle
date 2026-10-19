@@ -1,0 +1,22 @@
+num_ticks = 4
+
+[image_comparisons.initial]
+trigger = 1
+tolerance = 2
+
+[image_comparisons.changed]
+trigger = 3
+tolerance = 2
+
+[image_comparisons.cleared]
+trigger = 4
+tolerance = 2
+
+[player_options]
+with_renderer = { optional = false, quality = "high" }
+
+[[compilers]]
+type = "Asc"
+class = "Test"
+scripts = ["Test.as"]
+swf_version = 11
