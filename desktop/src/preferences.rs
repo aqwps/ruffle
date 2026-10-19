@@ -10,6 +10,7 @@ use crate::log::FilenamePattern;
 use crate::preferences::read::read_preferences;
 use crate::preferences::write::PreferencesWriter;
 use anyhow::{Context, Error};
+use is_wine::is_wine_lax;
 use ruffle_core::backend::ui::US_ENGLISH;
 use ruffle_frontend_utils::bookmarks::{Bookmarks, BookmarksWriter, read_bookmarks};
 use ruffle_frontend_utils::parse::DocumentHolder;
@@ -305,8 +306,16 @@ impl Default for SavedGlobalPreferences {
             .and_then(|l| l.parse().ok())
             .unwrap_or_else(|| US_ENGLISH.clone());
 
+        let mut preffered_backend = GraphicsBackend::default();
+        if cfg!(target_os = "windows") {
+            preffered_backend = GraphicsBackend::Dx12;
+            if is_wine_lax() {
+                preffered_backend = GraphicsBackend::Vulkan;
+            }
+        }
+
         Self {
-            graphics_backend: Default::default(),
+            graphics_backend: preffered_backend,
             graphics_power_preference: Default::default(),
             gamemode_preference: Default::default(),
             language: locale,

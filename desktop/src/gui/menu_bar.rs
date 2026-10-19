@@ -182,7 +182,7 @@ impl MenuBar {
                         self.launch_website(ui, "https://discord.gg/ruffle");
                     }
                     if ui.button(text(locale, "help-menu-report-a-bug")).clicked() {
-                        self.launch_website(ui, "https://github.com/ruffle-rs/ruffle/issues/new?assignees=&labels=bug&projects=&template=bug_report.yml");
+                        self.launch_website(ui, "https://github.com/aqwps/ruffle/issues/new?assignees=lazuee&labels=bug&projects=&template=bug_report.yml");
                     }
                     if ui.button(text(locale, "help-menu-sponsor-development")).clicked() {
                         self.launch_website(ui, "https://opencollective.com/ruffle/");

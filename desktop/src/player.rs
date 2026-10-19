@@ -318,9 +318,9 @@ impl ActivePlayer {
                 .expect("Couldn't create ui backend"),
             )
             .with_autoplay(true)
-            .with_letterbox(opt.player.letterbox.unwrap_or(Letterbox::On))
+            .with_letterbox(opt.player.letterbox.unwrap_or(Letterbox::Off))
             .with_max_execution_duration(opt.player.max_execution_duration.unwrap_or(Duration::MAX))
-            .with_quality(opt.player.quality.unwrap_or(StageQuality::High))
+            .with_quality(opt.player.quality.unwrap_or(StageQuality::High16x16))
             .with_align(
                 opt.player.align.unwrap_or_default(),
                 opt.player.force_align.unwrap_or_default(),

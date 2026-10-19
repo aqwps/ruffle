@@ -81,7 +81,7 @@ function createPanicAction({
         url = url.split(/[?#]/, 1)[0]!;
 
         const issueTitle = `Error on ${url}`;
-        let issueLink = `https://github.com/ruffle-rs/ruffle/issues/new?title=${encodeURIComponent(
+        let issueLink = `https://github.com/aqwps/ruffle/issues/new?title=${encodeURIComponent(
             issueTitle,
         )}&template=error_report.md&labels=error-report&body=`;
         let issueBody = encodeURIComponent(errorText);

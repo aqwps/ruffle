@@ -46,6 +46,9 @@ pub enum RuffleEvent {
     /// Ruffle core has a notification to handle.
     PlayerNotification(PlayerNotification),
 
+    // The movie wants to resize the window.
+    Resize(u32, u32),
+
     /// Export Ruffle Bundle from currently playing content and open save dialog.
     ExportBundle,
 }

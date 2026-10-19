@@ -254,7 +254,11 @@ impl GuiController {
         }
 
         let response = self.egui_winit.on_window_event(&self.window, event);
-        if response.repaint {
+        // AQW build: egui asks for a repaint on every mouse move. When it shows nothing, the
+        // repaint would only present the movie's last frame again (extra presents that frame
+        // counters and frame generation tools such as Lossless Scaling count as frames); the
+        // input still reaches egui with the next movie frame.
+        if response.repaint && self.wants_redraws() {
             self.window.request_redraw();
         }
         response.consumed
@@ -522,6 +526,11 @@ impl GuiController {
 
     pub fn needs_render(&self) -> bool {
         Instant::now().duration_since(self.last_update) >= self.repaint_after
+    }
+
+    /// AQW build: whether GUI-only repaints are useful: egui shows something, or is about to.
+    pub fn wants_redraws(&self) -> bool {
+        self.ui_visible || self.gui.is_context_menu_visible()
     }
 
     pub fn show_open_dialog(&mut self) {

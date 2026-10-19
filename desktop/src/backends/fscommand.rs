@@ -13,6 +13,14 @@ impl FsCommandProvider for DesktopFSCommandProvider {
             "quit" => {
                 let _ = self.event_loop.send_event(RuffleEvent::ExitRequested);
             }
+            "resize" => {
+                let mut parts = args.split('x');
+                let width = parts.next().unwrap().parse::<u32>().unwrap();
+                let height = parts.next().unwrap().parse::<u32>().unwrap();
+                let _ = self
+                    .event_loop
+                    .send_event(RuffleEvent::Resize(width, height));
+            }
             "fullscreen" => {
                 match args {
                     "true" => {

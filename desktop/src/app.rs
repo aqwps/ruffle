@@ -18,10 +18,25 @@ use std::sync::Arc;
 use std::time::Instant;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize, Size};
-use winit::event::{ElementState, Ime, KeyEvent, Modifiers, StartCause, WindowEvent};
+use winit::event::{ElementState, Ime, KeyEvent, Modifiers, StartCause, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Fullscreen, Icon, WindowAttributes, WindowId};
+
+
+/// AQW build: the time each `perf_counters::timers` timer added since `before`, in ms
+/// (only the nonzero ones).
+fn timer_parts(before: &[u64; ruffle_render_wgpu::perf_counters::timers::LEN]) -> String {
+    use ruffle_render_wgpu::perf_counters::timers;
+    let parts = timers::NAMES
+        .iter()
+        .zip(timers::snapshot().iter().zip(before))
+        .filter(|(_, (a, b))| *a > *b)
+        .map(|(name, (a, b))| format!("{name} {:.1}", (a - b) as f64 / 1000.0))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if parts.is_empty() { "none of the timed work".to_string() } else { parts }
+}
 
 struct MainWindow {
     preferences: GlobalPreferences,
@@ -58,9 +73,76 @@ impl MainWindow {
             // surface also keeps the size it had before, as `GuiController::resize`
             // refuses to reconfigure it to a zero size.
             if !self.minimized && !self.occluded {
-                self.gui.render(self.player.get());
-            }
+                let started = Instant::now();
+                let timers_before = ruffle_render_wgpu::perf_counters::timers::snapshot();
+                let walk_before = ruffle_core::render_walk_micros();
+                let mut player = self.player.get();
+                let frame_budget_ms = player
+                    .as_ref()
+                    .map_or(1000.0 / 24.0, |player| 1000.0 / player.frame_rate());
+                let mut rendered_movie = false;
+                if let Some(ref mut player) = player {
+                    // AQW build: egui asks for a repaint on every mouse move, and each repaint
+                    // used to re-render the whole movie too. The movie view keeps the last
+                    // frame, so only re-render it when a new SWF frame ran (or it was resized).
+                    // Even if the movie is paused, user interaction with debug tools can change the render output
 
+                    // With frame interpolation on, a new in-between picture goes out on the
+                    // first refresh after it's due, every n refreshes' time; the refreshes in
+                    // between show the last one again (see `pace_interpolation`). Timed, not
+                    // counted: a long draw (e.g. 11 ms in Yulgar) makes presents miss refreshes.
+                    let interpolating = self.next_draw_time.is_some();
+                    let new_picture_due = if interpolating {
+                        let interval = self.refresh_interval * self.draw_divisor;
+                        let due = self.picture_due + interval;
+                        if started + self.refresh_interval / 2 >= due {
+                            // Keep the rhythm, unless it fell more than a picture behind.
+                            self.picture_due = if started < due + interval {
+                                due
+                            } else {
+                                started
+                            };
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        self.frame_since_render
+                    };
+                    if new_picture_due || !player.is_playing() || extra_renders_enabled() {
+                        player.render();
+                        rendered_movie = true;
+                    }
+                }
+                let movie_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+                self.gui.render(player);
+                self.perf.presents += 1;
+                self.count_fps();
+                self.frame_since_render = false;
+                self.last_redraw = Instant::now();
+                self.draw_started = started;
+                if rendered_movie {
+                    let total_ms = started.elapsed().as_secs_f64() * 1000.0;
+                    // Drawing the movie only (presenting can include waiting for the refresh);
+                    // one-off slow draws, e.g. of new shapes, count at most 3x the average.
+                    let cost = movie_ms.min(self.draw_cost_ms * 3.0);
+                    self.draw_cost_ms = self.draw_cost_ms * 0.9 + cost * 0.1;
+                    self.perf.render(total_ms);
+                    // AQW build: say what a slow render (longer than 1.2 frames) spent its
+                    // time on.
+                    if total_ms > frame_budget_ms * 0.9 {
+                        let parts = timer_parts(&timers_before);
+                        let walk_ms =
+                            (ruffle_core::render_walk_micros() - walk_before) as f64 / 1000.0;
+                        tracing::info!(
+                            target: "ruffle_aqw_perf",
+                            "slow render {total_ms:.0} ms: movie {movie_ms:.0} ms, window/present {:.0} ms; build_commands {walk_ms:.1}, {parts} (ms)",
+                            total_ms - movie_ms
+                        );
+                    }
+                }
+            }
             // Important that we return here, or we'll get a feedback loop with egui
             // (winit says redraw, egui hears redraw and says redraw, we hear redraw and tell winit to redraw...)
             return;
@@ -210,6 +292,32 @@ impl MainWindow {
             }
             WindowEvent::ModifiersChanged(new_modifiers) => {
                 self.modifiers = new_modifiers;
+            }
+            WindowEvent::Touch(winit::event::Touch {
+                phase, location, ..
+            }) => {
+                self.mouse_pos = location;
+                let (x, y) = self.gui.window_to_movie_position(location);
+                use ruffle_core::events::MouseButton as RuffleMouseButton;
+                if phase == TouchPhase::Started {
+                    let event = PlayerEvent::MouseDown {
+                        x,
+                        y,
+                        button: RuffleMouseButton::Left,
+                        index: None,
+                    };
+                    self.handle_player_event(event);
+                } else if phase == TouchPhase::Moved {
+                    let event = PlayerEvent::MouseMove { x, y };
+                    self.handle_player_event(event);
+                } else if phase == TouchPhase::Ended {
+                    let event = PlayerEvent::MouseUp {
+                        x,
+                        y,
+                        button: RuffleMouseButton::Left,
+                    };
+                    self.handle_player_event(event);
+                }
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if self.gui.is_context_menu_visible() {
@@ -385,14 +493,52 @@ impl MainWindow {
         // We should look at changing our tick to happen somewhere else if we see any behavioural problems.
         if matches!(self.loaded, LoadingState::Loaded) {
             let new_time = Instant::now();
+            // This runs after every batch of OS events (so ~1000 times a second while a
+            // gaming mouse moves); only hit-test when a movie frame is actually due.
+            if self.next_frame_time.is_none_or(|t| new_time >= t) {
+                self.flush_mouse_move();
+            }
             let dt = FloatDuration::from_std(new_time.duration_since(self.time));
             if dt.as_millis() > 0.0 {
                 self.time = new_time;
+                let perf = &mut self.perf;
+                let frame_since_render = &mut self.frame_since_render;
+                let frame_cost_ms = &mut self.frame_cost_ms;
                 self.next_frame_time = self.player.get().map(|mut player| {
+                    let frames_before = player.frames_run();
+                    let timers_before = ruffle_render_wgpu::perf_counters::timers::snapshot();
                     player.tick(dt);
+                    if player.frames_run() != frames_before {
+                        *frame_since_render = true;
+                        let frame_ms = new_time.elapsed().as_secs_f64() * 1000.0;
+                        *frame_cost_ms = *frame_cost_ms * 0.9 + frame_ms * 0.1;
+                        // AQW build: say what a slow frame (scripts etc., longer than 1.2
+                        // frames) spent its time on, e.g. when a crowded room loads.
+                        if frame_ms > 1.2 * 1000.0 / player.frame_rate() {
+                            tracing::info!(
+                                target: "ruffle_aqw_perf",
+                                "slow frame {frame_ms:.0} ms ({} frames run); of that: {} (ms)",
+                                player.frames_run() - frames_before,
+                                timer_parts(&timers_before)
+                            );
+                        }
+                        perf.frame(
+                            new_time,
+                            frame_ms,
+                            1000.0 / player.frame_rate(),
+                            player.frames_run() - frames_before,
+                        );
+                    }
+                    if perf.maybe_log(new_time) {
+                        memory_watch(&mut player);
+                        perf.log_object_counts(&mut player);
+                        crate::mugetsu::low_quality_tick(&mut player, perf.last_drawn_fps);
+                    }
                     new_time + player.time_til_next_frame()
                 });
+                self.render_movie_if_needed();
             }
+            self.pace_interpolation();
         }
 
         self.render_movie_if_needed();
@@ -409,6 +555,92 @@ impl MainWindow {
         handled
     }
 
+    /// AQW build: with frame interpolation on (title-bar menu), sends a picture on every refresh
+    /// of the monitor: vsync makes each one wait for its refresh, which paces this exactly (a
+    /// timer is ~1-2 ms late, a lot at 360 Hz). A new in-between picture is drawn on every n-th
+    /// of them, the most the main thread can afford, so each stays up the same time; the others
+    /// show the last one again, which costs little. Needs at least 1.5 new pictures per SWF
+    /// frame, else it draws once per frame as without interpolation.
+    fn pace_interpolation(&mut self) {
+        self.next_draw_time = None;
+        if !ruffle_core::frame_interpolation::enabled() || self.minimized || self.occluded {
+            return;
+        }
+        let now = Instant::now();
+        if self
+            .refresh_checked
+            .is_none_or(|checked| now.duration_since(checked) > Duration::from_secs(2))
+        {
+            let first = self.refresh_checked.is_none();
+            self.refresh_checked = Some(now);
+            let millihertz = self
+                .gui
+                .window()
+                .current_monitor()
+                .and_then(|monitor| monitor.refresh_rate_millihertz())
+                .unwrap_or(60_000)
+                .clamp(24_000, 360_000);
+            let interval = Duration::from_secs_f64(1000.0 / millihertz as f64);
+            if interval != self.refresh_interval || first {
+                tracing::info!(
+                    target: "ruffle_aqw_perf",
+                    "frame interpolation: monitor refreshes at {:.1} Hz",
+                    millihertz as f64 / 1000.0
+                );
+            }
+            self.refresh_interval = interval;
+        }
+        let frame_rate = match self.player.get() {
+            Some(player) if player.is_playing() => player.frame_rate(),
+            _ => return,
+        };
+        // Draw on every refresh if the main thread can afford it (keeping a third of its time
+        // spare), else on every 2nd, 3rd, ... refresh: an even rate looks smoother than an
+        // uneven higher one. Each change of rate is a visible change of rhythm, so it only steps
+        // to fewer pictures after needing to for half a second, and back to more after 3 seconds
+        // of clearly affording it.
+        let refresh_hz = 1.0 / self.refresh_interval.as_secs_f64();
+        let spare_ms = (650.0 - self.frame_cost_ms * frame_rate).max(100.0);
+        let divisor_for = |cost_ms: f64| {
+            (refresh_hz * cost_ms.max(0.5) / spare_ms).ceil().clamp(1.0, 16.0) as u32
+        };
+        let needed = divisor_for(self.draw_cost_ms);
+        let lasted = |since: &mut Option<Instant>, wanted: bool, secs: f64| {
+            if !wanted {
+                *since = None;
+                return false;
+            }
+            now.duration_since(*since.get_or_insert(now)).as_secs_f64() >= secs
+        };
+        if lasted(&mut self.divisor_up_since, needed > self.draw_divisor, 0.5)
+            || lasted(
+                &mut self.divisor_down_since,
+                divisor_for(self.draw_cost_ms * 1.3) < self.draw_divisor,
+                3.0,
+            )
+        {
+            self.draw_divisor = needed;
+            self.divisor_up_since = None;
+            self.divisor_down_since = None;
+        }
+        let interval = self.refresh_interval * self.draw_divisor;
+        self.perf.interpolation_rate = refresh_hz / self.draw_divisor as f64;
+        if interval.as_secs_f64() * 1.5 > 1.0 / frame_rate {
+            // Not even 1.5 draws per SWF frame: draw once per frame, as without interpolation.
+            return;
+        }
+        // Requested right away, keeping the screen's queue of pictures full so a busy moment on
+        // the main thread doesn't miss a refresh; presenting waits for vsync. The timer only
+        // limits this if presenting doesn't wait.
+        let early = self.refresh_interval / 2;
+        let mut due = self.draw_started + early;
+        if now >= due {
+            self.gui.window().request_redraw();
+            due = now + early;
+        }
+        self.next_draw_time = Some(due);
+    }
+
     fn flush_mouse_move(&mut self) {
         if !std::mem::take(&mut self.mouse_move_pending) {
             return;
@@ -419,9 +651,18 @@ impl MainWindow {
         self.render_movie_if_needed();
     }
 
+    // self.check_redraw() -> self.render_movie_if_needed()
     fn render_movie_if_needed(&self) {
         let mut player = self.player.get();
-        let player_needs_render = player.as_ref().is_some_and(|p| p.needs_render());
+        // AQW build: like Flash Player's normal pacing, only draw once a new SWF frame has run.
+        // AQW calls `updateAfterEvent()` from timers and hovers change between frames, which
+        // made Ruffle redraw the same frame 2-9x per frame interval; in combat those extra
+        // draws cost the main thread the time the next frame needed. A paused movie still
+        // redraws on demand.
+        let player_needs_render = player.as_ref().is_some_and(|p| {
+            p.needs_render()
+                && (self.frame_since_render || !p.is_playing() || extra_renders_enabled())
+        });
         if player_needs_render
             && !self.minimized
             && !self.occluded
@@ -429,7 +670,21 @@ impl MainWindow {
         {
             player.render();
         }
-        if player_needs_render || self.gui.needs_render() {
+
+        let player_needs_render = player
+            .map(|p| {
+                p.needs_render()
+                    && (self.frame_since_render || !p.is_playing() || extra_renders_enabled())
+            })
+            .unwrap_or_default();
+        // AQW build: egui asks for a repaint on every mouse move. Each repaint presents, and
+        // presenting faster than the monitor refreshes blocks the main thread, so moving the
+        // mouse made frames late. With the menu bar hidden there is usually nothing to update,
+        // so GUI-only repaints are capped at ~60/s (popups and dialogs still work).
+        let gui_needs_render = self.gui.needs_render()
+            && self.gui.wants_redraws()
+            && (!self.no_gui || self.last_redraw.elapsed() >= Duration::from_millis(16));
+        if player_needs_render || gui_needs_render {
             self.gui.window().request_redraw();
         }
     }
@@ -641,6 +896,28 @@ impl ApplicationHandler<RuffleEvent> for App {
                     .create_movie(&mut main_window.player, *options, desc);
             }
 
+            (Some(main_window), RuffleEvent::Resize(width, height)) => {
+                if let Some(mut player) = main_window.player.get() {
+                    let width = width.max(1) as f64 * main_window.gui.window().scale_factor();
+                    let height = height.max(1) as f64 * main_window.gui.window().scale_factor();
+                    player.set_viewport_dimensions(ViewportDimensions {
+                        width: width as u32,
+                        height: height as u32,
+                        scale_factor: main_window.gui.window().scale_factor(),
+                    });
+                    let inner_size = PhysicalSize::new(width as f64, height as f64);
+                    main_window
+                        .gui
+                        .window()
+                        .set_min_inner_size(Some(inner_size));
+                    main_window
+                        .gui
+                        .window()
+                        .set_max_inner_size(Some(inner_size));
+                    let _ = main_window.gui.window().request_inner_size(inner_size);
+                }
+            }
+
             (Some(main_window), RuffleEvent::OpenDialog(descriptor)) => {
                 main_window.gui.open_dialog(descriptor);
             }
@@ -730,7 +1007,13 @@ impl ApplicationHandler<RuffleEvent> for App {
             // Note: the control flow might be set to `ControlFlow::WaitUntil` with a
             // timestamp in the past! Take that into consideration when changing this code.
             if let Some(next_frame_time) = main_window.next_frame_time {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(next_frame_time));
+                let wake = match (main_window.next_frame_time, main_window.next_draw_time) {
+                    (Some(frame), Some(draw)) => Some(frame.min(draw)),
+                    (frame, draw) => frame.or(draw),
+                };
+                if let Some(wake) = wake {
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(wake));
+                }
             }
         }
     }
